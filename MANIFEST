@@ -1,5 +1,4 @@
 Changes
-check_random.inc
 LICENSE
 MANIFEST
 Makefile.PL
@@ -9,16 +8,12 @@ SECURITY.md
 lib/Crypt/URandom.pm
 t/00.load.t
 t/boilerplate.t
-t/getrandom.t
 t/pod.t
-t/pp.t
 t/rand.t
 t/export.t
 t/core_fork.t
 t/core_partial_read.t
 t/core_read.t
-t/core_sysopen.t
 t/manifest.t
-URandom.xs
 META.yml                                 Module meta-data (added by MakeMaker)
 META.json                                Module JSON meta-data (added by MakeMaker)

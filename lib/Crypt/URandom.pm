@@ -1,212 +1,56 @@
 package Crypt::URandom;
+our $VERSION = '0.50';
 
 use warnings;
 use strict;
 use Carp();
-use English qw( -no_match_vars );
-use Exporter();
-*import = \&Exporter::import;
-our @EXPORT_OK = qw(
-  urandom
-  urandom_ub
-  getrandom
-);
+use Exporter 'import';
+use Errno ();
 
+our @EXPORT_OK = qw( urandom urandom_ub getrandom );
 our %EXPORT_TAGS = ( 'all' => \@EXPORT_OK, );
 
-our @CARP_NOT = ('Crypt::URandom');
+if (eval { require Crypt::SysRandom }) {
+	*urandom = sub {
+		my ($count) = @_;
+		Carp::croak('The length argument must be supplied and must be an integer') if not defined $count or $count =~ /\D/;
+		local $SIG{__DIE__} = \&Carp::croak;
+		return Crypt::SysRandom::random_bytes($count);
+	};
+} elsif (eval { require Win32::API }) {
+	my $genrand = Win32::API->new('advapi32', 'INT SystemFunction036(PVOID RandomBuffer, ULONG RandomBufferLength)')
+		or Carp::croak("Could not import SystemFunction036: $^E");
 
-BEGIN {
-    our $VERSION = '0.50';
-    eval {
-        require XSLoader;
+	*urandom = sub {
+		my ($count) = @_;
+		return '' if $count == 0;
+		Carp::croak('The length argument must be supplied and must be an integer') if not defined $count or $count =~ /\D/;
+		my $buffer = chr(0) x $count;
+		$genrand->Call($buffer, $count) or Carp::croak("Could not read random data");
+		return $buffer;
+	};
+} elsif (-e '/dev/urandom') {
+	open my $fh, '<:raw', '/dev/urandom' or Carp::croak("Couldn't open /dev/urandom: $!");
+	*urandom = sub {
+		my ($count) = @_;
+		Carp::croak('The length argument must be supplied and must be an integer') if not defined $count or $count =~ /\D/;
 
-        XSLoader::load( __PACKAGE__, $VERSION );
-    } or do {
-    };
+		my ($result, $offset) = ('', 0);
+		while ($offset < $count) {
+			my $read = sysread $fh, $result, $count - $offset, $offset;
+			next if not defined $read and $!{EINTR};
+			Carp::croak("Couldn't read random data") if not defined $read or $read == 0;
+			$offset += $read;
+		}
+		return $result;
+	};
+} else {
+	Carp::croak("No source of randomness found");
 }
 
-## no critic (ProhibitConstantPragma)
-# using constant for the speed benefit of constant-folding of values
 
-use constant CRYPT_SILENT      => 64;                     # hex 40
-use constant PROV_RSA_FULL     => 1;
-use constant VERIFY_CONTEXT    => 4_026_531_840;          # hex 'F0000000'
-use constant W2K_MAJOR_VERSION => 5;
-use constant W2K_MINOR_VERSION => 0;
-use constant OS_FREEBSD        => $OSNAME eq 'freebsd';
-use constant OS_WIN32          => $OSNAME eq 'MSWin32';
-use constant PATH              => do {
-    my $path = '/dev/urandom';
-    if ( OS_FREEBSD() ) {
-        $path = '/dev/random';    # FreeBSD's /dev/random is non-blocking
-    }
-    $path;
-};
-use constant GETRANDOM_AVAILABLE => do {
-    my $result = 0;
-    eval {
-        my $correct_length = 2;
-        $result = getrandom($correct_length);
-    } or do {
-        $result = undef;
-    };
-    $result;
-};
-
-## use critic
-
-my $_initialised;
-my $_context;
-my $_cryptgenrandom;
-my $_rtlgenrand;
-my $_urandom_handle;
-
-sub _init {
-    if ( OS_WIN32() ) {
-        require Win32;
-        require Win32::API;
-        require Win32::API::Type;
-        my ( $major, $minor ) = ( Win32::GetOSVersion() )[ 1, 2 ];
-        my $ntorlower = ( $major < W2K_MAJOR_VERSION() ) ? 1 : 0;
-        my $w2k =
-          ( $major == W2K_MAJOR_VERSION() and $minor == W2K_MINOR_VERSION() )
-          ? 1
-          : 0;
-
-        if ($ntorlower) {
-            Carp::croak(
-'No secure alternative for random number generation for Win32 versions older than W2K'
-            );
-        }
-        elsif ($w2k) {
-
-            my $crypt_acquire_context_a =
-              Win32::API->new( 'advapi32', 'CryptAcquireContextA', 'PPPNN',
-                'I' );
-            if ( !defined $crypt_acquire_context_a ) {
-                Carp::croak(
-                    "Could not import CryptAcquireContext: $EXTENDED_OS_ERROR");
-            }
-
-            my $context = chr(0) x Win32::API::Type->sizeof('PULONG');
-            my $result =
-              $crypt_acquire_context_a->Call( $context, 0, 0, PROV_RSA_FULL(),
-                CRYPT_SILENT() | VERIFY_CONTEXT() );
-            my $pack_type = Win32::API::Type::packing('PULONG');
-            $context = unpack $pack_type, $context;
-            if ( !$result ) {
-                Carp::croak("CryptAcquireContext failed: $EXTENDED_OS_ERROR");
-            }
-
-            my $crypt_gen_random =
-              Win32::API->new( 'advapi32', 'CryptGenRandom', 'NNP', 'I' );
-            if ( !defined $crypt_gen_random ) {
-                Carp::croak(
-                    "Could not import CryptGenRandom: $EXTENDED_OS_ERROR");
-            }
-            $_context        = $context;
-            $_cryptgenrandom = $crypt_gen_random;
-        }
-        else {
-            my $rtlgenrand =
-              Win32::API->new( 'advapi32', <<'_RTLGENRANDOM_PROTO_');
-INT SystemFunction036(
-  PVOID RandomBuffer,
-  ULONG RandomBufferLength
-)
-_RTLGENRANDOM_PROTO_
-            if ( !defined $rtlgenrand ) {
-                Carp::croak(
-                    "Could not import SystemFunction036: $EXTENDED_OS_ERROR");
-            }
-            $_rtlgenrand = $rtlgenrand;
-        }
-    }
-    else {
-        require FileHandle;
-        $_urandom_handle = FileHandle->new( PATH(), Fcntl::O_RDONLY() )
-          or Carp::croak(
-            q[Failed to open ] . PATH() . qq[ for reading:$OS_ERROR] );
-        binmode $_urandom_handle;
-    }
-    return;
-}
-
-sub urandom_ub {
-    my ($length) = @_;
-    return _urandom( 'sysread', $length );
-}
-
-sub urandom {
-    my ($length) = @_;
-    return _urandom( 'read', $length );
-}
-
-sub _urandom {
-    my ( $type, $length ) = @_;
-
-    my $length_ok;
-    if ( defined $length ) {
-        if ( $length =~ /^\d+$/xms ) {
-            $length_ok = 1;
-        }
-    }
-    if ( !$length_ok ) {
-        Carp::croak(
-            'The length argument must be supplied and must be an integer');
-    }
-    if ( !GETRANDOM_AVAILABLE() ) {
-        if (
-            !( ( defined $_initialised ) && ( $_initialised == $PROCESS_ID ) ) )
-        {
-            _init();
-            $_initialised = $PROCESS_ID;
-        }
-    }
-    if ( OS_WIN32() ) {
-        my $buffer = chr(0) x $length;
-        if ($_cryptgenrandom) {
-
-            my $result = $_cryptgenrandom->Call( $_context, $length, $buffer );
-            if ( !$result ) {
-                Carp::croak("CryptGenRandom failed: $EXTENDED_OS_ERROR");
-            }
-        }
-        elsif ($_rtlgenrand) {
-
-            my $result = $_rtlgenrand->Call( $buffer, $length );
-            if ( !$result ) {
-                Carp::croak("RtlGenRand failed: $EXTENDED_OS_ERROR");
-            }
-        }
-        return $buffer;
-    }
-    elsif ( GETRANDOM_AVAILABLE() ) {
-        return getrandom($length);
-    }
-    else {
-        my $result = $_urandom_handle->$type( my $buffer, $length );
-        if ( defined $result ) {
-            if ( $result == $length ) {
-                return $buffer;
-            }
-            else {
-                my $error = $EXTENDED_OS_ERROR;
-                $_urandom_handle = undef;
-                $_initialised    = undef;
-                Carp::croak(
-                    qq[Only read $result bytes from ] . PATH() . qq[:$error] );
-            }
-        }
-        else {
-            my $error = $EXTENDED_OS_ERROR;
-            $_urandom_handle = undef;
-            $_initialised    = undef;
-            Carp::croak( q[Failed to read from ] . PATH() . qq[:$error] );
-        }
-    }
-}
+*urandom_ub = \&urandom;
+*getrandom = \&urandom;
 
 1;    # Magic true value required at end of module
 __END__
